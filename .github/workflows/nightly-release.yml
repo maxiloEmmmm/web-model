@@ -85,30 +85,24 @@ jobs:
           echo "date=${nightly_date}" >> "$GITHUB_OUTPUT"
           echo "tag=${nightly_tag}" >> "$GITHUB_OUTPUT"
 
-      - name: Publish prerelease
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Verify packaged assets
         shell: bash
         run: |
           set -euo pipefail
-
-          tag="${{ steps.meta.outputs.tag }}"
-          title="Nightly ${{ steps.meta.outputs.date }}"
-
-          mapfile -t files < <(find release-assets -type f -name '*-all.tgz' | sort)
-          if [ "${#files[@]}" -eq 0 ]; then
+          find release-assets -type f -name '*-all.tgz' | sort
+          count="$(find release-assets -type f -name '*-all.tgz' | wc -l | tr -d ' ')"
+          if [ "$count" -eq 0 ]; then
             echo "no packaged assets found" >&2
             exit 1
           fi
 
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release edit "$tag" \
-              --title "$title" \
-              --prerelease
-            gh release upload "$tag" "${files[@]}" --clobber
-          else
-            gh release create "$tag" "${files[@]}" \
-              --title "$title" \
-              --notes "Automated nightly prerelease build." \
-              --prerelease
-          fi
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Nightly ${{ steps.meta.outputs.date }}
+          body: Automated nightly prerelease build.
+          prerelease: true
+          make_latest: false
+          files: |
+            release-assets/**/*-all.tgz
