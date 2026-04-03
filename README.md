@@ -1,8 +1,77 @@
 # web-model
 
-`web-model` turns real browser chat tabs into a local OpenAI-compatible API.
+Turn real browser AI chat tabs into a local OpenAI-compatible API.
 
-It runs a local Go server, accepts browser extension registrations over WebSocket, and exposes each registered tab as a model under `/v1/models`. When you call `/v1/chat/completions`, the request is forwarded into the real web page, the extension submits the prompt, then returns the parsed answer.
+`web-model` runs a local Go server, accepts live browser tab registrations over WebSocket, and exposes each registered tab as a model under `/v1/models`.
+
+When you call `/v1/chat/completions`, the request is forwarded into the real web page, the extension submits the prompt, and the parsed answer comes back through a normal OpenAI-style response.
+
+This is useful when:
+
+- the provider only works reliably in a real logged-in browser session
+- normal WebDriver automation is fragile or gets detected
+- you want one local API in front of multiple web chat products
+
+## Why This Exists
+
+Many AI products work fine in a normal browser session but become painful once you try to automate them with classic browser automation.
+
+`web-model` takes a simpler approach:
+
+- keep the real website
+- keep the real logged-in session
+- use a browser extension as the bridge
+- expose everything behind one local API
+
+That means you can call providers like ChatGPT, Qwen, Gemini, Kimi, or Yuanbao through the same local endpoint without writing a separate integration for each site.
+
+## Highlights
+
+- OpenAI-compatible endpoints: `/v1/models` and `/v1/chat/completions`
+- Real browser tab backed providers, not fake mocks
+- Works with Chrome and Edge through one MV3 extension
+- Supports streaming through the local API
+- Supports multiple web providers behind one local server
+- Keeps provider-specific page logic inside extension adapters
+
+## Quick Start
+
+### 1. Start the server
+
+```bash
+go run ./cmd/web-model
+```
+
+### 2. Load the extension
+
+Load [`extension/`](./extension) as an unpacked extension in Chrome or Edge.
+
+### 3. Open a supported site and enable the tab
+
+- log in to the site by hand
+- make sure the page is usable
+- keep the left sidebar visible
+- set the popup `Server URL` to `ws://127.0.0.1:8080/ws`
+- enable the current tab in the popup
+
+### 4. Call the local API
+
+```bash
+curl http://127.0.0.1:8080/v1/models
+```
+
+Then send a request using one registered tab key:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "kimi-tab-2123080689",
+    "messages": [
+      { "role": "user", "content": "hi" }
+    ]
+  }'
+```
 
 ## What It Is
 
@@ -28,6 +97,37 @@ The rule is simple: if the page is not already usable by hand, `web-model` is no
 - Kimi: `https://www.kimi.com/`
 - Yuanbao: `https://yuanbao.tencent.com/`
 
+## One-Screen Mental Model
+
+```text
++-------------------+      +--------------------+      +------------------+
+| Your Script / App | ---> | Local OpenAI API   | ---> | web-model Server |
++-------------------+      | /v1/models         |      +------------------+
+                           | /v1/chat/completions|               |
+                           +--------------------+                |
+                                                                 v
+                                                      +----------------------+
+                                                      | Browser Extension    |
+                                                      | background/content   |
+                                                      +----------------------+
+                                                                 |
+                                                                 v
+                                                      +----------------------+
+                                                      | Real Browser Tab     |
+                                                      | ChatGPT / Qwen /     |
+                                                      | Gemini / Kimi /      |
+                                                      | Yuanbao              |
+                                                      +----------------------+
+                                                                 |
+                                                                 v
+                                                      +----------------------+
+                                                      | Real Provider Website|
+                                                      | cookies / auth / UI  |
+                                                      +----------------------+
+```
+
+You keep the provider's real web UI, cookies, auth, and page behavior.
+
 ## How It Works
 
 1. Start the local server.
@@ -42,9 +142,27 @@ The rule is simple: if the page is not already usable by hand, `web-model` is no
 8. The server exposes the registered tab key in `/v1/models`.
 9. You call `/v1/chat/completions` with that key as the `model`.
 
-At a high level:
+At a lower level:
 
-`HTTP client -> web-model server -> extension background -> content script -> real web page`
+```text
+HTTP client
+    |
+    v
+web-model server
+    |
+    v
+extension background
+    |
+    v
+content script
+    |
+    +--> page adapter  -> fill input / click send / click new chat
+    |
+    +--> page hook     -> capture fetch/xhr / parse streamed answer
+    |
+    v
+real web page
+```
 
 ## Repository Layout
 
@@ -455,4 +573,3 @@ Non-goals:
 - handling site login flows
 - bypassing site-side restrictions
 - generic web automation outside supported providers
-
