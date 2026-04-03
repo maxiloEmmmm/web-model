@@ -1,0 +1,114 @@
+name: Nightly Release
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions cron uses UTC.
+    # 19:00 UTC == 03:00 Asia/Shanghai on the next day.
+    - cron: "0 19 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            asset_prefix: linux-amd64
+            binary_name: web-model
+          - goos: darwin
+            goarch: amd64
+            asset_prefix: macos-amd64
+            binary_name: web-model
+          - goos: windows
+            goarch: amd64
+            asset_prefix: windows-amd64
+            binary_name: web-model.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          stage_dir="dist/${{ matrix.asset_prefix }}"
+          mkdir -p "${stage_dir}"
+
+          CGO_ENABLED=0 GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
+            go build -trimpath -ldflags="-s -w" \
+            -o "${stage_dir}/${{ matrix.binary_name }}" \
+            ./cmd/web-model
+
+          cp -R extension "${stage_dir}/extension"
+
+          tar -C dist -czf "dist/${{ matrix.asset_prefix }}-all.tgz" "${{ matrix.asset_prefix }}"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_prefix }}-all
+          path: dist/${{ matrix.asset_prefix }}-all.tgz
+          if-no-files-found: error
+
+  release:
+    name: Publish nightly release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Compute release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          nightly_date="$(TZ=Asia/Shanghai date +%Y-%m-%d)"
+          nightly_tag="$(TZ=Asia/Shanghai date +nightly-%Y%m%d)"
+          echo "date=${nightly_date}" >> "$GITHUB_OUTPUT"
+          echo "tag=${nightly_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${{ steps.meta.outputs.tag }}"
+          title="Nightly ${{ steps.meta.outputs.date }}"
+
+          mapfile -t files < <(find release-assets -type f -name '*-all.tgz' | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no packaged assets found" >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --title "$title" \
+              --prerelease
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" \
+              --title "$title" \
+              --notes "Automated nightly prerelease build." \
+              --prerelease
+          fi
