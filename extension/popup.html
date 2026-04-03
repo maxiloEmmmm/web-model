@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>web-model</title>
+    <style>
+      body {
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 12px;
+        min-width: 280px;
+      }
+
+      label {
+        display: block;
+        margin: 0 0 10px;
+      }
+
+      input {
+        box-sizing: border-box;
+        width: 100%;
+        margin-top: 4px;
+      }
+
+      button {
+        margin-top: 8px;
+      }
+
+      #currentProviderKey {
+        background: #f5f5f5;
+      }
+
+      #status {
+        background: #f5f5f5;
+        border-radius: 8px;
+        color: #333;
+        margin-top: 10px;
+        min-height: 18px;
+        padding: 8px;
+        white-space: pre-wrap;
+      }
+
+      #status.ok {
+        background: #edf8ef;
+        color: #146c2e;
+      }
+
+      #status.warn {
+        background: #fff6e5;
+        color: #8a5b00;
+      }
+
+      #status.error {
+        background: #fdecec;
+        color: #b42318;
+      }
+    </style>
+  </head>
+  <body>
+    <label>
+      Server URL
+      <input id="serverUrl" type="text" />
+    </label>
+    <label>
+      Enable Current Tab
+      <input id="enabled" type="checkbox" />
+    </label>
+    <label>
+      Debug Logs
+      <input id="debugLogs" type="checkbox" />
+    </label>
+    <button id="save" type="button">Save</button>
+    <div id="status"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>
