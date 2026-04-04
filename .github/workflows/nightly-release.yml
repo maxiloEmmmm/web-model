@@ -1,4 +1,4 @@
-name: Nightly Release
+name: Scheduled Release
 
 on:
   workflow_dispatch:
@@ -12,52 +12,116 @@ permissions:
 
 jobs:
   precheck:
-    name: Precheck nightly commit
+    name: Compute release metadata
     runs-on: ubuntu-latest
     outputs:
-      should_skip: ${{ steps.check.outputs.should_skip }}
-      should_create_latest: ${{ steps.check.outputs.should_create_latest }}
+      should_skip: ${{ steps.meta.outputs.should_skip }}
+      next_version: ${{ steps.meta.outputs.next_version }}
+      release_notes: ${{ steps.meta.outputs.release_notes }}
     steps:
-      - name: Check latest nightly release commit
-        id: check
+      - name: Compute version and release notes
+        id: meta
         uses: actions/github-script@v7
         with:
           script: |
-            const currentSha = context.sha;
+            const currentSha = context.sha.toLowerCase();
             const { owner, repo } = context.repo;
+
             const releases = await github.paginate(github.rest.repos.listReleases, {
               owner,
               repo,
               per_page: 100
             });
 
-            const hasStableRelease = releases.some((release) => !release.prerelease && !release.draft);
-            core.setOutput("should_create_latest", hasStableRelease ? "false" : "true");
+            const stableReleases = releases.filter((release) => !release.prerelease && !release.draft);
+            const latestStable = stableReleases[0] || null;
 
-            const nightly = releases.find((release) =>
-              release.prerelease &&
-              typeof release.tag_name === "string" &&
-              release.tag_name.startsWith("nightly-")
-            );
-
-            if (!nightly) {
-              core.info("no previous nightly release found");
-              core.setOutput("should_skip", "false");
-              return;
+            if (latestStable) {
+              const body = latestStable.body || "";
+              const match = body.match(/Commit:\s*([0-9a-f]{40})/i);
+              if (match && match[1].toLowerCase() === currentSha) {
+                core.info("current commit already released");
+                core.setOutput("should_skip", "true");
+                core.setOutput("next_version", latestStable.tag_name || "");
+                core.setOutput("release_notes", "");
+                return;
+              }
             }
 
-            const body = nightly.body || "";
-            const match = body.match(/Commit:\s*([0-9a-f]{40})/i);
-            if (!match) {
-              core.info("previous nightly release has no commit marker");
-              core.setOutput("should_skip", "false");
-              return;
+            function parseVersion(tag) {
+              const match = String(tag || "").match(/^(\d+)\.(\d+)\.(\d+)$/);
+              if (!match) {
+                return null;
+              }
+              return {
+                major: Number(match[1]),
+                minor: Number(match[2]),
+                patch: Number(match[3])
+              };
             }
 
-            const previousSha = match[1].toLowerCase();
-            core.info(`current sha: ${currentSha}`);
-            core.info(`previous nightly sha: ${previousSha}`);
-            core.setOutput("should_skip", previousSha === currentSha.toLowerCase() ? "true" : "false");
+            let highest = { major: 0, minor: 0, patch: 0 };
+            let hasSemver = false;
+            for (const release of stableReleases) {
+              const parsed = parseVersion(release.tag_name);
+              if (!parsed) {
+                continue;
+              }
+              hasSemver = true;
+              const isHigher =
+                parsed.major > highest.major ||
+                (parsed.major === highest.major && parsed.minor > highest.minor) ||
+                (parsed.major === highest.major && parsed.minor === highest.minor && parsed.patch > highest.patch);
+              if (isHigher) {
+                highest = parsed;
+              }
+            }
+
+            let nextVersion = "0.0.1";
+            if (hasSemver) {
+              let { major, minor, patch } = highest;
+              patch += 1;
+              if (patch >= 100) {
+                patch = 0;
+                minor += 1;
+              }
+              if (minor >= 100) {
+                minor = 0;
+                major += 1;
+              }
+              nextVersion = `${major}.${minor}.${patch}`;
+            }
+
+            let releaseNotes = "- Initial release";
+            if (latestStable) {
+              try {
+                const compare = await github.rest.repos.compareCommits({
+                  owner,
+                  repo,
+                  base: latestStable.tag_name,
+                  head: context.sha
+                });
+                const commits = compare.data.commits || [];
+                if (commits.length > 0) {
+                  releaseNotes = commits
+                    .map((commit) => {
+                      const sha = commit.sha.slice(0, 7);
+                      const message = String(commit.commit.message || "").split("\n")[0].trim();
+                      return `- ${sha} ${message || "update"}`;
+                    })
+                    .join("\n");
+                } else {
+                  releaseNotes = "- No code changes found in compare range";
+                }
+              } catch (error) {
+                core.warning(`compare failed: ${error.message}`);
+                releaseNotes = "- Release notes unavailable";
+              }
+            }
+
+            core.setOutput("should_skip", "false");
+            core.setOutput("next_version", nextVersion);
+            core.setOutput("release_notes", releaseNotes);
 
   build:
     name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
@@ -123,7 +187,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Publish nightly release
+    name: Publish release
     runs-on: ubuntu-latest
     needs:
       - precheck
@@ -136,18 +200,6 @@ jobs:
         with:
           path: release-assets
 
-      - name: Compute release metadata
-        id: meta
-        shell: bash
-        run: |
-          set -euo pipefail
-          nightly_date="$(TZ=Asia/Shanghai date +%Y-%m-%d)"
-          nightly_tag="$(TZ=Asia/Shanghai date +nightly-%Y%m%d)"
-          stable_tag="$(TZ=Asia/Shanghai date +release-%Y%m%d)"
-          echo "date=${nightly_date}" >> "$GITHUB_OUTPUT"
-          echo "tag=${nightly_tag}" >> "$GITHUB_OUTPUT"
-          echo "stable_tag=${stable_tag}" >> "$GITHUB_OUTPUT"
-
       - name: Verify packaged assets
         shell: bash
         run: |
@@ -159,30 +211,18 @@ jobs:
             exit 1
           fi
 
-      - name: Publish prerelease
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: Nightly ${{ steps.meta.outputs.date }}
+          tag_name: ${{ needs.precheck.outputs.next_version }}
+          name: ${{ needs.precheck.outputs.next_version }}
           body: |
-            Automated nightly prerelease build.
+            Automated scheduled release.
 
             Commit: ${{ github.sha }}
-          prerelease: true
-          make_latest: false
-          files: |
-            release-assets/**/*-all.tgz
 
-      - name: Publish latest stable release
-        if: needs.precheck.outputs.should_create_latest == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.meta.outputs.stable_tag }}
-          name: latest
-          body: |
-            Initial stable release created from nightly workflow.
-
-            Commit: ${{ github.sha }}
+            Changes since previous release:
+            ${{ needs.precheck.outputs.release_notes }}
           prerelease: false
           make_latest: true
           files: |
