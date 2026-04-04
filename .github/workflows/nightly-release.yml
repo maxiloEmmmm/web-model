@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should_skip: ${{ steps.check.outputs.should_skip }}
+      should_create_latest: ${{ steps.check.outputs.should_create_latest }}
     steps:
       - name: Check latest nightly release commit
         id: check
@@ -29,6 +30,9 @@ jobs:
               repo,
               per_page: 100
             });
+
+            const hasStableRelease = releases.some((release) => !release.prerelease && !release.draft);
+            core.setOutput("should_create_latest", hasStableRelease ? "false" : "true");
 
             const nightly = releases.find((release) =>
               release.prerelease &&
@@ -131,8 +135,10 @@ jobs:
           set -euo pipefail
           nightly_date="$(TZ=Asia/Shanghai date +%Y-%m-%d)"
           nightly_tag="$(TZ=Asia/Shanghai date +nightly-%Y%m%d)"
+          stable_tag="$(TZ=Asia/Shanghai date +release-%Y%m%d)"
           echo "date=${nightly_date}" >> "$GITHUB_OUTPUT"
           echo "tag=${nightly_tag}" >> "$GITHUB_OUTPUT"
+          echo "stable_tag=${stable_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Verify packaged assets
         shell: bash
@@ -156,5 +162,20 @@ jobs:
             Commit: ${{ github.sha }}
           prerelease: true
           make_latest: false
+          files: |
+            release-assets/**/*-all.tgz
+
+      - name: Publish latest stable release
+        if: needs.precheck.outputs.should_create_latest == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.stable_tag }}
+          name: latest
+          body: |
+            Initial stable release created from nightly workflow.
+
+            Commit: ${{ github.sha }}
+          prerelease: false
+          make_latest: true
           files: |
             release-assets/**/*-all.tgz
