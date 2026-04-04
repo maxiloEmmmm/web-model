@@ -22,6 +22,8 @@ import (
 const (
 	messageTypeHello       = "hello"
 	messageTypeHelloAck    = "hello.ack"
+	messageTypePing        = "ping"
+	messageTypePong        = "pong"
 	messageTypeError       = "error"
 	messageTypeChatRequest = "chat.request"
 	messageTypeChatDelta   = "chat.delta"
@@ -41,6 +43,7 @@ type Manager struct {
 	mu                 sync.RWMutex
 	agents             map[string]*session
 	chatCounts         map[string]int
+	penaltyUntil       map[string]time.Time
 	counter            atomic.Uint64
 	maxChatsPerSession int
 }
@@ -51,6 +54,7 @@ type Snapshot struct {
 	ChatCount          int
 	RemainingChats     int
 	MaxChatsPerSession int
+	PenaltyUntil       time.Time
 }
 
 type Config struct {
@@ -65,6 +69,7 @@ func NewManager(cfg Config) *Manager {
 	return &Manager{
 		agents:             make(map[string]*session),
 		chatCounts:         make(map[string]int),
+		penaltyUntil:       make(map[string]time.Time),
 		maxChatsPerSession: maxChatsPerSession,
 	}
 }
@@ -203,6 +208,7 @@ func (m *Manager) Snapshots() []Snapshot {
 			ChatCount:          current,
 			RemainingChats:     remaining,
 			MaxChatsPerSession: m.maxChatsPerSession,
+			PenaltyUntil:       m.penaltyUntil[key],
 		})
 	}
 	return items
@@ -270,6 +276,16 @@ func (s *session) Meta() provider.Meta {
 	meta := s.meta
 	meta.Tags = append([]string(nil), s.meta.Tags...)
 	return meta
+}
+
+func (s *session) Busy() bool {
+	return s.busy.Load()
+}
+
+func (s *session) PenaltyUntil() time.Time {
+	s.manager.mu.RLock()
+	defer s.manager.mu.RUnlock()
+	return s.manager.penaltyUntil[s.meta.Key]
 }
 
 func (s *session) Chat(ctx context.Context, req chat.Request) (chat.Response, error) {
@@ -395,6 +411,19 @@ func (s *session) readLoop() {
 		}
 
 		switch envelope.Type {
+		case messageTypePing:
+			var msg heartbeatEnvelope
+			if err := json.Unmarshal(envelope.Payload, &msg); err != nil {
+				s.closeWithError(fmt.Errorf("decode ping: %w", err))
+				return
+			}
+			if err := s.writeJSON(heartbeatEnvelope{
+				Type: messageTypePong,
+				At:   msg.At,
+			}); err != nil {
+				s.closeWithError(fmt.Errorf("write pong: %w", err))
+				return
+			}
 		case messageTypeChatDelta:
 			var msg chatDeltaEnvelope
 			if err := json.Unmarshal(envelope.Payload, &msg); err != nil {
@@ -551,6 +580,9 @@ func (s *session) recordChatError(startedNewChat bool) {
 		s.manager.chatCounts[s.meta.Key] = 0
 		log.Printf("[agent] chat count reset after new chat error key=%s chat_count=0", s.meta.Key)
 	}
+	until := time.Now().Add(time.Minute)
+	s.manager.penaltyUntil[s.meta.Key] = until
+	log.Printf("[agent] chat penalty updated key=%s penalty_until=%s", s.meta.Key, until.Format(time.RFC3339))
 }
 
 type chatResult struct {
@@ -591,6 +623,11 @@ type helloEnvelope struct {
 type helloAckEnvelope struct {
 	Type string `json:"type"`
 	Key  string `json:"key"`
+}
+
+type heartbeatEnvelope struct {
+	Type string `json:"type"`
+	At   int64  `json:"at,omitempty"`
 }
 
 type chatRequestEnvelope struct {

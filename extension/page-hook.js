@@ -949,7 +949,23 @@
     const capture = buildCapture(providerType, url, bodyText);
     emitCaptureStart(capture);
 
-    const response = await originalFetch(input, init);
+    let response;
+    try {
+      response = await originalFetch(input, init);
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error);
+      log("capture error", {
+        providerType: capture.providerType,
+        captureId: capture.captureId,
+        error: message
+      });
+      emit("capture.error", {
+        captureId: capture.captureId,
+        providerType: capture.providerType,
+        error: message
+      });
+      throw error;
+    }
     const contentType = response.headers.get("content-type") || "";
 
     if (capture.providerType === "gemini" || capture.providerType === "kimi" || contentType.includes("text/event-stream")) {

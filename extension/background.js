@@ -50,6 +50,8 @@ const ACTION_BADGE_COLORS = {
   connecting: "#c98a00",
   error: "#c53030"
 };
+const SOCKET_HEARTBEAT_INTERVAL_MS = 15000;
+const SOCKET_HEARTBEAT_TIMEOUT_MS = 45000;
 
 function hasScriptingAPI() {
   return !!(chrome.scripting && typeof chrome.scripting.executeScript === "function");
@@ -293,6 +295,13 @@ async function handlePortMessage(tabId, message) {
     if (session.enabled && session.provider && !session.socket && session.port) {
       scheduleReconnect(session, "heartbeat");
     }
+    try {
+      session.port?.postMessage({
+        type: "pong",
+        at: Date.now()
+      });
+    } catch (_error) {
+    }
     return;
   }
 
@@ -422,9 +431,11 @@ async function connectTab(tabId, reason = "auto connect") {
 
   session.socket.addEventListener("close", () => {
     log("websocket close", `tab=${tabId}`);
+    clearSocketHeartbeat(session);
     if (session.socket) {
       session.socket = null;
       session.helloAcked = false;
+      session.lastSocketPongAt = 0;
       if (session.state !== "error") {
         session.state = "disconnected";
         session.detail = "socket closed";
@@ -435,6 +446,7 @@ async function connectTab(tabId, reason = "auto connect") {
 
   session.socket.addEventListener("error", (error) => {
     console.error("[web-model:bg] socket error", `tab=${tabId}`, error);
+    clearSocketHeartbeat(session);
     session.lastError = "websocket error";
     session.state = "error";
     session.detail = "websocket error";
@@ -452,9 +464,16 @@ function onSocketMessage(session, payload) {
   if (payload.type === "hello.ack") {
     session.helloAcked = true;
     session.currentProviderKey = payload.key || session.currentProviderKey;
+    session.lastSocketPongAt = Date.now();
+    startSocketHeartbeat(session);
     session.state = "connected";
     session.detail = `${session.provider?.type || "provider"} registered`;
     log("provider registered", `tab=${session.tabId}`, session.currentProviderKey);
+    return;
+  }
+
+  if (payload.type === "pong") {
+    session.lastSocketPongAt = Date.now();
     return;
   }
 
@@ -517,6 +536,7 @@ function sendToServer(session, payload) {
 }
 
 function closeSessionSocket(session, reason = "") {
+  clearSocketHeartbeat(session);
   if (session.socket) {
     log("closing websocket", `tab=${session.tabId}`, reason);
     try {
@@ -526,6 +546,41 @@ function closeSessionSocket(session, reason = "") {
     session.socket = null;
   }
   session.helloAcked = false;
+  session.lastSocketPongAt = 0;
+}
+
+function startSocketHeartbeat(session) {
+  clearSocketHeartbeat(session);
+  session.lastSocketPongAt = Date.now();
+  session.socketHeartbeatTimer = window.setInterval(() => {
+    if (!session.socket || session.socket.readyState !== WebSocket.OPEN || !session.helloAcked) {
+      return;
+    }
+    if (session.lastSocketPongAt && Date.now() - session.lastSocketPongAt > SOCKET_HEARTBEAT_TIMEOUT_MS) {
+      log("socket heartbeat timeout", `tab=${session.tabId}`, session.currentProviderKey || "");
+      clearSocketHeartbeat(session);
+      session.lastError = "heartbeat timeout";
+      session.state = "disconnected";
+      session.detail = "heartbeat timeout";
+      try {
+        session.socket.close();
+      } catch (_error) {
+      }
+      return;
+    }
+    sendToServer(session, {
+      type: "ping",
+      at: Date.now()
+    });
+  }, SOCKET_HEARTBEAT_INTERVAL_MS);
+}
+
+function clearSocketHeartbeat(session) {
+  if (!session?.socketHeartbeatTimer) {
+    return;
+  }
+  window.clearInterval(session.socketHeartbeatTimer);
+  session.socketHeartbeatTimer = null;
 }
 
 function scheduleReconnect(session, reason) {
@@ -575,7 +630,9 @@ function ensureSession(tabId) {
       detail: "registration disabled",
       lastError: "",
       currentProviderKey: "",
-      retryTimer: null
+      retryTimer: null,
+      socketHeartbeatTimer: null,
+      lastSocketPongAt: 0
     };
     tabSessions.set(tabId, session);
   }

@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -16,6 +18,12 @@ import (
 type Server struct {
 	store   provider.Store
 	counter atomic.Uint64
+}
+
+type providerSelection struct {
+	model      string
+	providers  []provider.Provider
+	isWildcard bool
 }
 
 func NewServer(store provider.Store, wsHandler http.Handler) http.Handler {
@@ -165,26 +173,19 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "messages is required")
 		return
 	}
-	p, ok := s.store.Get(req.Model)
-	if !ok {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("unknown provider %q", req.Model))
+
+	selection, err := s.selectProviders(req.Model)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
 	if req.Stream {
-		s.handleChatCompletionsStream(w, r, req, p)
+		s.handleChatCompletionsStream(w, r, req, selection)
 		return
 	}
 
-	result, err := p.Chat(r.Context(), chat.Request{
-		Model:       req.Model,
-		Messages:    req.Messages,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		MaxTokens:   req.MaxTokens,
-		Stop:        req.Stop,
-		User:        req.User,
-	})
+	result, selectedModel, err := runChat(r.Context(), selection, req)
 	if err != nil {
 		if errors.Is(err, provider.ErrBusy) {
 			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "provider is busy")
@@ -198,7 +199,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ID:      s.nextID(),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
-		Model:   req.Model,
+		Model:   selectedModel,
 		Choices: []chatCompletionChoice{
 			{
 				Index:        0,
@@ -216,53 +217,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Request, req chatCompletionRequest, p provider.Provider) {
+func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Request, req chatCompletionRequest, selection providerSelection) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeOpenAIError(w, http.StatusInternalServerError, "server_error", "streaming is not supported by this server")
 		return
 	}
 
-	streamer, ok := p.(provider.Streamer)
-	if !ok {
-		result, err := p.Chat(r.Context(), chat.Request{
-			Model:       req.Model,
-			Messages:    req.Messages,
-			Temperature: req.Temperature,
-			TopP:        req.TopP,
-			MaxTokens:   req.MaxTokens,
-			Stop:        req.Stop,
-			User:        req.User,
-		})
-		if err != nil {
-			if errors.Is(err, provider.ErrBusy) {
-				writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "provider is busy")
-				return
-			}
-			writeOpenAIError(w, http.StatusBadGateway, "provider_error", err.Error())
-			return
-		}
-		writeSSEHeaders(w)
-		chunkID := s.nextID()
-		createdAt := time.Now().Unix()
-		writeSSEChunk(w, flusher, buildRoleChunk(chunkID, createdAt, req.Model))
-		if content := result.Message.Content; content != "" {
-			writeSSEChunk(w, flusher, buildContentChunk(chunkID, createdAt, req.Model, content))
-		}
-		writeSSEChunk(w, flusher, buildStopChunk(chunkID, createdAt, req.Model))
-		writeSSEDone(w, flusher)
-		return
-	}
-
-	events, err := streamer.ChatStream(r.Context(), chat.Request{
-		Model:       req.Model,
-		Messages:    req.Messages,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		MaxTokens:   req.MaxTokens,
-		Stop:        req.Stop,
-		User:        req.User,
-	})
+	events, fallback, selectedModel, err := runChatStream(r.Context(), selection, req)
 	if err != nil {
 		if errors.Is(err, provider.ErrBusy) {
 			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "provider is busy")
@@ -275,13 +237,22 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 	writeSSEHeaders(w)
 	chunkID := s.nextID()
 	createdAt := time.Now().Unix()
-	writeSSEChunk(w, flusher, buildRoleChunk(chunkID, createdAt, req.Model))
+	writeSSEChunk(w, flusher, buildRoleChunk(chunkID, createdAt, selectedModel))
+
+	if fallback != nil {
+		if content := fallback.Message.Content; content != "" {
+			writeSSEChunk(w, flusher, buildContentChunk(chunkID, createdAt, selectedModel, content))
+		}
+		writeSSEChunk(w, flusher, buildStopChunk(chunkID, createdAt, selectedModel))
+		writeSSEDone(w, flusher)
+		return
+	}
 
 	var streamedContent strings.Builder
 	for event := range events {
 		if event.Delta != "" {
 			streamedContent.WriteString(event.Delta)
-			writeSSEChunk(w, flusher, buildContentChunk(chunkID, createdAt, req.Model, event.Delta))
+			writeSSEChunk(w, flusher, buildContentChunk(chunkID, createdAt, selectedModel, event.Delta))
 		}
 
 		if event.Err != nil {
@@ -300,18 +271,166 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 						remainder = fullContent
 					}
 					if remainder != "" {
-						writeSSEChunk(w, flusher, buildContentChunk(chunkID, createdAt, req.Model, remainder))
+						writeSSEChunk(w, flusher, buildContentChunk(chunkID, createdAt, selectedModel, remainder))
 					}
 				}
 			}
-			writeSSEChunk(w, flusher, buildStopChunk(chunkID, createdAt, req.Model))
+			writeSSEChunk(w, flusher, buildStopChunk(chunkID, createdAt, selectedModel))
 			writeSSEDone(w, flusher)
 			return
 		}
 	}
 
-	writeSSEChunk(w, flusher, buildStopChunk(chunkID, createdAt, req.Model))
+	writeSSEChunk(w, flusher, buildStopChunk(chunkID, createdAt, selectedModel))
 	writeSSEDone(w, flusher)
+}
+
+func (s *Server) selectProviders(model string) (providerSelection, error) {
+	trimmed := strings.TrimSpace(model)
+	if trimmed == "" {
+		return providerSelection{}, fmt.Errorf("model is required")
+	}
+	if trimmed == "*" {
+		return providerSelection{
+			model:      trimmed,
+			providers:  s.randomizedProviders(""),
+			isWildcard: true,
+		}, nil
+	}
+	if strings.HasSuffix(trimmed, "*") {
+		providerType := strings.TrimSpace(strings.TrimSuffix(trimmed, "*"))
+		if providerType == "" {
+			return providerSelection{}, fmt.Errorf("model %q is invalid", model)
+		}
+		providers := s.randomizedProviders(providerType)
+		if len(providers) == 0 {
+			return providerSelection{}, fmt.Errorf("unknown provider %q", trimmed)
+		}
+		return providerSelection{
+			model:      trimmed,
+			providers:  providers,
+			isWildcard: true,
+		}, nil
+	}
+
+	p, ok := s.store.Get(trimmed)
+	if !ok {
+		return providerSelection{}, fmt.Errorf("unknown provider %q", trimmed)
+	}
+	return providerSelection{
+		model:      trimmed,
+		providers:  []provider.Provider{p},
+		isWildcard: false,
+	}, nil
+}
+
+func (s *Server) randomizedProviders(providerType string) []provider.Provider {
+	items := s.store.List()
+	healthy := make([]provider.Provider, 0, len(items))
+	penalized := make([]provider.Provider, 0, len(items))
+	now := time.Now()
+	for _, item := range items {
+		if providerType != "" && item.Type != providerType {
+			continue
+		}
+		p, ok := s.store.Get(item.Key)
+		if !ok {
+			continue
+		}
+		until := time.Time{}
+		if penalty, ok := p.(provider.PenaltyChecker); ok {
+			until = penalty.PenaltyUntil()
+		}
+		if until.After(now) {
+			penalized = append(penalized, p)
+			continue
+		}
+		healthy = append(healthy, p)
+	}
+	rand.Shuffle(len(healthy), func(i, j int) {
+		healthy[i], healthy[j] = healthy[j], healthy[i]
+	})
+	rand.Shuffle(len(penalized), func(i, j int) {
+		penalized[i], penalized[j] = penalized[j], penalized[i]
+	})
+	if len(healthy) == 0 {
+		return penalized
+	}
+	return append(healthy, penalized...)
+}
+
+func buildChatRequest(req chatCompletionRequest, model string) chat.Request {
+	return chat.Request{
+		Model:       model,
+		Messages:    req.Messages,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		MaxTokens:   req.MaxTokens,
+		Stop:        req.Stop,
+		User:        req.User,
+	}
+}
+
+func runChat(ctx context.Context, selection providerSelection, req chatCompletionRequest) (chat.Response, string, error) {
+	var busyCount int
+	for _, p := range selection.providers {
+		model := p.Meta().Key
+		if busy, ok := p.(provider.BusyChecker); ok && busy.Busy() {
+			busyCount++
+			if selection.isWildcard {
+				continue
+			}
+		}
+		result, err := p.Chat(ctx, buildChatRequest(req, model))
+		if errors.Is(err, provider.ErrBusy) {
+			busyCount++
+			if selection.isWildcard {
+				continue
+			}
+		}
+		return result, model, err
+	}
+	if selection.isWildcard && busyCount > 0 {
+		return chat.Response{}, "", provider.ErrBusy
+	}
+	return chat.Response{}, "", fmt.Errorf("unknown provider %q", selection.model)
+}
+
+func runChatStream(ctx context.Context, selection providerSelection, req chatCompletionRequest) (<-chan chat.StreamEvent, *chat.Response, string, error) {
+	var busyCount int
+	for _, p := range selection.providers {
+		model := p.Meta().Key
+		if busy, ok := p.(provider.BusyChecker); ok && busy.Busy() {
+			busyCount++
+			if selection.isWildcard {
+				continue
+			}
+		}
+		streamer, ok := p.(provider.Streamer)
+		if !ok {
+			result, err := p.Chat(ctx, buildChatRequest(req, model))
+			if errors.Is(err, provider.ErrBusy) {
+				busyCount++
+				if selection.isWildcard {
+					continue
+				}
+			}
+			return nil, &result, model, err
+		}
+
+		events, err := streamer.ChatStream(ctx, buildChatRequest(req, model))
+		if errors.Is(err, provider.ErrBusy) {
+			busyCount++
+			if selection.isWildcard {
+				continue
+			}
+		}
+		return events, nil, model, err
+	}
+	if selection.isWildcard && busyCount > 0 {
+		return nil, nil, "", provider.ErrBusy
+	}
+	return nil, nil, "", fmt.Errorf("unknown provider %q", selection.model)
 }
 
 func (s *Server) nextID() string {

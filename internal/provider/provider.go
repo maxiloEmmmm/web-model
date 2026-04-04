@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"web-model/internal/chat"
 )
@@ -20,6 +21,14 @@ type Provider interface {
 
 type Streamer interface {
 	ChatStream(ctx context.Context, req chat.Request) (<-chan chat.StreamEvent, error)
+}
+
+type BusyChecker interface {
+	Busy() bool
+}
+
+type PenaltyChecker interface {
+	PenaltyUntil() time.Time
 }
 
 type SetupOpener interface {

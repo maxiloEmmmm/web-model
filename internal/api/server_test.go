@@ -203,13 +203,126 @@ func TestChatCompletionsReturns429WhenProviderBusy(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsWildcardSelectsNonBusyProvider(t *testing.T) {
+	registry := provider.NewRegistry()
+	registry.MustRegister(busyProvider{name: "demo", key: "demo-busy"})
+	registry.MustRegister(staticProvider{name: "demo", key: "demo-ready"})
+
+	server := NewServer(registry, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"*","messages":[{"role":"user","content":"x"}]}`))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp chatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Model != "demo-ready" {
+		t.Fatalf("expected model demo-ready, got %q", resp.Model)
+	}
+}
+
+func TestChatCompletionsWildcardByTypeSelectsMatchingProvider(t *testing.T) {
+	registry := provider.NewRegistry()
+	registry.MustRegister(staticProvider{name: "qwen", key: "qwen-ready"})
+	registry.MustRegister(staticProvider{name: "kimi", key: "kimi-ready"})
+
+	server := NewServer(registry, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"kimi*","messages":[{"role":"user","content":"x"}]}`))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp chatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Model != "kimi-ready" {
+		t.Fatalf("expected model kimi-ready, got %q", resp.Model)
+	}
+}
+
+func TestChatCompletionsWildcardReturns429WhenAllCandidatesBusy(t *testing.T) {
+	registry := provider.NewRegistry()
+	registry.MustRegister(busyProvider{name: "qwen", key: "qwen-busy"})
+	registry.MustRegister(busyProvider{name: "kimi", key: "kimi-busy"})
+
+	server := NewServer(registry, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"*","messages":[{"role":"user","content":"x"}]}`))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestChatCompletionsWildcardPrefersNonPenalizedProvider(t *testing.T) {
+	registry := provider.NewRegistry()
+	registry.MustRegister(staticProvider{name: "kimi", key: "kimi-penalized", penaltyUntil: time.Now().Add(time.Minute)})
+	registry.MustRegister(staticProvider{name: "kimi", key: "kimi-ready"})
+
+	server := NewServer(registry, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"kimi*","messages":[{"role":"user","content":"x"}]}`))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp chatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Model != "kimi-ready" {
+		t.Fatalf("expected model kimi-ready, got %q", resp.Model)
+	}
+}
+
+func TestChatCompletionsWildcardFallsBackToPenalizedWhenNeeded(t *testing.T) {
+	registry := provider.NewRegistry()
+	registry.MustRegister(staticProvider{name: "kimi", key: "kimi-penalized", penaltyUntil: time.Now().Add(time.Minute)})
+
+	server := NewServer(registry, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"*","messages":[{"role":"user","content":"x"}]}`))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp chatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Model != "kimi-penalized" {
+		t.Fatalf("expected model kimi-penalized, got %q", resp.Model)
+	}
+}
+
 type staticProvider struct {
-	name string
-	key  string
+	name         string
+	key          string
+	penaltyUntil time.Time
 }
 
 type busyProvider struct {
 	name string
+	key  string
 }
 
 type streamingProvider struct {
@@ -233,6 +346,10 @@ func (p staticProvider) Meta() provider.Meta {
 	}
 }
 
+func (p staticProvider) PenaltyUntil() time.Time {
+	return p.penaltyUntil
+}
+
 func (p staticProvider) Chat(_ context.Context, _ chat.Request) (chat.Response, error) {
 	return chat.Response{
 		Message: chat.Message{
@@ -249,8 +366,12 @@ func (p busyProvider) Name() string {
 }
 
 func (p busyProvider) Meta() provider.Meta {
+	key := p.key
+	if key == "" {
+		key = p.name
+	}
 	return provider.Meta{
-		Key:         p.name,
+		Key:         key,
 		Type:        p.name,
 		DisplayName: "Busy Provider",
 		Description: "Always reports busy for API tests.",
@@ -259,6 +380,10 @@ func (p busyProvider) Meta() provider.Meta {
 
 func (p busyProvider) Chat(_ context.Context, _ chat.Request) (chat.Response, error) {
 	return chat.Response{}, provider.ErrBusy
+}
+
+func (p busyProvider) Busy() bool {
+	return true
 }
 
 func (p streamingProvider) Name() string {

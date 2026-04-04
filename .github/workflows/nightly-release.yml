@@ -72,14 +72,17 @@ jobs:
             goarch: amd64
             asset_prefix: linux-amd64
             binary_name: web-model
+            helper_binary_name: chat_by_type
           - goos: darwin
             goarch: amd64
             asset_prefix: macos-amd64
             binary_name: web-model
+            helper_binary_name: chat_by_type
           - goos: windows
             goarch: amd64
             asset_prefix: windows-amd64
             binary_name: web-model.exe
+            helper_binary_name: chat_by_type.exe
 
     steps:
       - name: Checkout
@@ -102,6 +105,11 @@ jobs:
             go build -trimpath -ldflags="-s -w" \
             -o "${stage_dir}/${{ matrix.binary_name }}" \
             ./cmd/web-model
+
+          CGO_ENABLED=0 GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
+            go build -trimpath -ldflags="-s -w" \
+            -o "${stage_dir}/${{ matrix.helper_binary_name }}" \
+            ./scripts/chat_by_type.go
 
           cp -R extension "${stage_dir}/extension"
 

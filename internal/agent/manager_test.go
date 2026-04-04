@@ -130,6 +130,52 @@ func TestManagerRoutesChatOverWebsocket(t *testing.T) {
 	<-done
 }
 
+func TestManagerRepliesToPingWithPong(t *testing.T) {
+	manager := NewManager(Config{})
+	server := httptest.NewServer(manager)
+	t.Cleanup(func() {
+		server.Close()
+		_ = manager.Close()
+	})
+
+	conn := dialTestSocket(t, server.URL)
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{
+		"type":          "hello",
+		"key":           "kimi-main",
+		"provider_type": "kimi",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var ack map[string]any
+	if err := conn.ReadJSON(&ack); err != nil {
+		t.Fatal(err)
+	}
+	if ack["type"] != "hello.ack" {
+		t.Fatalf("unexpected ack: %+v", ack)
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"type": "ping",
+		"at":   float64(123456789),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var pong map[string]any
+	if err := conn.ReadJSON(&pong); err != nil {
+		t.Fatal(err)
+	}
+	if pong["type"] != "pong" {
+		t.Fatalf("unexpected pong: %+v", pong)
+	}
+	if got := int64(pong["at"].(float64)); got != 123456789 {
+		t.Fatalf("unexpected pong at: %d", got)
+	}
+}
+
 func TestManagerReplacesExistingConnectionForSameKey(t *testing.T) {
 	manager := NewManager(Config{})
 	server := httptest.NewServer(manager)

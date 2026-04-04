@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -41,6 +40,7 @@ type chatMessage struct {
 }
 
 type chatResponse struct {
+	Model   string       `json:"model"`
 	Choices []chatChoice `json:"choices"`
 }
 
@@ -49,6 +49,7 @@ type chatChoice struct {
 }
 
 type chatChunkResponse struct {
+	Model   string            `json:"model"`
 	Choices []chatChunkChoice `json:"choices"`
 }
 
@@ -84,25 +85,26 @@ func main() {
 
 	client := &http.Client{Timeout: 60 * time.Second}
 
-	random := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	modelKey, err := findRandomModelKeyByType(client, baseURL, providerType, random)
+	modelKey, err := resolveModelTarget(client, baseURL, providerType)
 	if err != nil {
 		exitf("%v", err)
 	}
 
-	answer, err := sendChat(client, baseURL, modelKey, question, stream)
+	answer, actualModel, err := sendChat(client, baseURL, modelKey, question, stream)
 	if err != nil {
 		exitf("%v", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "provider_type=%s key=%s\n", providerType, modelKey)
+	if strings.TrimSpace(actualModel) == "" {
+		actualModel = modelKey
+	}
+	fmt.Fprintf(os.Stderr, "provider_type=%s model=%s\n", providerType, actualModel)
 	if !stream {
 		fmt.Println(answer)
 	}
 }
 
-func findRandomModelKeyByType(client *http.Client, baseURL, providerType string, random *rand.Rand) (string, error) {
+func resolveModelTarget(client *http.Client, baseURL, model string) (string, error) {
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/v1/models", nil)
 	if err != nil {
 		return "", fmt.Errorf("build models request: %w", err)
@@ -127,8 +129,9 @@ func findRandomModelKeyByType(client *http.Client, baseURL, providerType string,
 		return "", fmt.Errorf("decode models response: %w", err)
 	}
 
+	target := strings.TrimSpace(model)
 	available := make([]string, 0, len(payload.Data))
-	matches := make([]string, 0, len(payload.Data))
+	matchCount := 0
 	for _, item := range payload.Data {
 		metaType := strings.TrimSpace(item.Metadata.Type)
 		metaKey := strings.TrimSpace(item.Metadata.Key)
@@ -136,29 +139,23 @@ func findRandomModelKeyByType(client *http.Client, baseURL, providerType string,
 		label := fmt.Sprintf("id=%s key=%s type=%s", modelID, metaKey, metaType)
 		available = append(available, label)
 
-		if modelMatchesType(item, providerType) {
-			key := strings.TrimSpace(item.Metadata.Key)
-			if key == "" {
-				key = strings.TrimSpace(item.ID)
-			}
-			if key != "" {
-				matches = append(matches, key)
-			}
+		if modelMatchesTarget(item, target) {
+			matchCount++
 		}
 	}
 
-	if len(matches) > 0 {
-		return matches[random.Intn(len(matches))], nil
+	if matchCount > 0 {
+		return target, nil
 	}
 
 	if len(available) == 0 {
 		return "", fmt.Errorf("no models returned by %s/v1/models", baseURL)
 	}
-	return "", fmt.Errorf("no model found for provider type %q; available models: %s", providerType, strings.Join(available, " | "))
+	return "", fmt.Errorf("no model matched %q; available models: %s", target, strings.Join(available, " | "))
 }
 
-func modelMatchesType(item modelInfo, providerType string) bool {
-	want := strings.ToLower(strings.TrimSpace(providerType))
+func modelMatchesTarget(item modelInfo, model string) bool {
+	want := strings.ToLower(strings.TrimSpace(model))
 	if want == "" {
 		return false
 	}
@@ -167,19 +164,24 @@ func modelMatchesType(item modelInfo, providerType string) bool {
 	metaKey := strings.ToLower(strings.TrimSpace(item.Metadata.Key))
 	modelID := strings.ToLower(strings.TrimSpace(item.ID))
 
+	if want == "*" {
+		return true
+	}
+	if strings.HasSuffix(want, "*") {
+		prefix := strings.TrimSpace(strings.TrimSuffix(want, "*"))
+		if prefix == "" {
+			return false
+		}
+		return metaType == prefix
+	}
+
 	if metaType == want || metaKey == want || modelID == want {
-		return true
-	}
-	if strings.HasPrefix(metaKey, want+"-") || strings.HasPrefix(modelID, want+"-") {
-		return true
-	}
-	if strings.HasPrefix(metaKey, want+"_") || strings.HasPrefix(modelID, want+"_") {
 		return true
 	}
 	return false
 }
 
-func sendChat(client *http.Client, baseURL, modelKey, question string, stream bool) (string, error) {
+func sendChat(client *http.Client, baseURL, modelKey, question string, stream bool) (string, string, error) {
 	raw, err := json.Marshal(chatRequest{
 		Model: modelKey,
 		Messages: []chatMessage{
@@ -191,18 +193,18 @@ func sendChat(client *http.Client, baseURL, modelKey, question string, stream bo
 		Stream: stream,
 	})
 	if err != nil {
-		return "", fmt.Errorf("encode chat request: %w", err)
+		return "", "", fmt.Errorf("encode chat request: %w", err)
 	}
 
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions", bytes.NewReader(raw))
 	if err != nil {
-		return "", fmt.Errorf("build chat request: %w", err)
+		return "", "", fmt.Errorf("build chat request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("request chat completion: %w", err)
+		return "", "", fmt.Errorf("request chat completion: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -212,33 +214,34 @@ func sendChat(client *http.Client, baseURL, modelKey, question string, stream bo
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("read chat response: %w", err)
+		return "", "", fmt.Errorf("read chat response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("chat request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", "", fmt.Errorf("chat request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var payload chatResponse
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", fmt.Errorf("decode chat response: %w", err)
+		return "", "", fmt.Errorf("decode chat response: %w", err)
 	}
 	if len(payload.Choices) == 0 {
-		return "", fmt.Errorf("chat response has no choices")
+		return "", "", fmt.Errorf("chat response has no choices")
 	}
 
-	return payload.Choices[0].Message.Content, nil
+	return payload.Choices[0].Message.Content, strings.TrimSpace(payload.Model), nil
 }
 
-func readChatStream(resp *http.Response) (string, error) {
+func readChatStream(resp *http.Response) (string, string, error) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("chat request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", "", fmt.Errorf("chat request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	var answer strings.Builder
+	actualModel := ""
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -254,6 +257,9 @@ func readChatStream(resp *http.Response) (string, error) {
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			continue
 		}
+		if actualModel == "" && strings.TrimSpace(chunk.Model) != "" {
+			actualModel = strings.TrimSpace(chunk.Model)
+		}
 		for _, choice := range chunk.Choices {
 			delta := choice.Delta.Content
 			if delta == "" {
@@ -265,10 +271,10 @@ func readChatStream(resp *http.Response) (string, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return answer.String(), fmt.Errorf("read chat stream: %w", err)
+		return answer.String(), actualModel, fmt.Errorf("read chat stream: %w", err)
 	}
 
-	return answer.String(), nil
+	return answer.String(), actualModel, nil
 }
 
 func exitf(format string, args ...any) {

@@ -87,7 +87,7 @@ func (m *AgentTeaModel) refresh() {
 }
 
 func renderAgentTable(items []agent.Snapshot) string {
-	headers := []string{"Key", "Type", "Busy", "Used", "Remaining"}
+	headers := []string{"Key", "Type", "Busy", "Used", "Remaining", "Penalty"}
 	rows := make([][]string, 0, len(items)+1)
 	rows = append(rows, headers)
 
@@ -98,6 +98,7 @@ func renderAgentTable(items []agent.Snapshot) string {
 			busyLabel(item.Busy),
 			fmt.Sprintf("%d", item.ChatCount),
 			fmt.Sprintf("%d", item.RemainingChats),
+			penaltyLabel(item.PenaltyUntil),
 		})
 	}
 
@@ -138,6 +139,44 @@ func busyLabel(busy bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+func penaltyLabel(until time.Time) string {
+	if until.IsZero() {
+		return "-"
+	}
+	remaining := time.Until(until)
+	if remaining <= 0 {
+		return "-"
+	}
+	return humanDuration(remaining)
+}
+
+func humanDuration(value time.Duration) string {
+	if value < time.Minute {
+		seconds := int(value.Round(time.Second) / time.Second)
+		if seconds < 1 {
+			seconds = 1
+		}
+		return fmt.Sprintf("%ds", seconds)
+	}
+	if value < time.Hour {
+		minutes := int(value.Round(time.Minute) / time.Minute)
+		if minutes < 1 {
+			minutes = 1
+		}
+		return fmt.Sprintf("%dm", minutes)
+	}
+	hours := int(value / time.Hour)
+	minutes := int((value % time.Hour).Round(time.Minute) / time.Minute)
+	if minutes == 60 {
+		hours += 1
+		minutes = 0
+	}
+	if minutes <= 0 {
+		return fmt.Sprintf("%dh", hours)
+	}
+	return fmt.Sprintf("%dh%dm", hours, minutes)
 }
 
 func padRight(value string, width int) string {
