@@ -598,6 +598,24 @@
     watchdogTimer = null;
   }
 
+  function isDisconnectedPortError(error) {
+    return String(error && error.message ? error.message : error).includes("disconnected port object");
+  }
+
+  function handleDisconnectedPort(reason) {
+    if (!port || extensionContextInvalidated) {
+      return;
+    }
+    log("content script port stale", reason);
+    clearHeartbeatTimer();
+    try {
+      port.disconnect();
+    } catch (_error) {
+    }
+    port = null;
+    scheduleReconnect(reason);
+  }
+
   function safePostMessage(payload) {
     if (!port || extensionContextInvalidated) {
       return false;
@@ -608,6 +626,10 @@
     } catch (error) {
       if (isExtensionContextInvalidated(error)) {
         invalidateExtensionContext("postMessage failed");
+        return false;
+      }
+      if (isDisconnectedPortError(error)) {
+        handleDisconnectedPort("postMessage failed: disconnected port");
         return false;
       }
       throw error;

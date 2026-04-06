@@ -124,6 +124,9 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "web-model-offscreen-keepalive") {
     log("offscreen keepalive connected");
     port.onMessage.addListener(() => {
+      reconcileSessions("offscreen keepalive").catch((error) => {
+        console.error("[web-model:bg] reconcile sessions failed", error);
+      });
     });
     port.onDisconnect.addListener(() => {
       log("offscreen keepalive disconnected");
@@ -145,6 +148,7 @@ chrome.runtime.onConnect.addListener((port) => {
 
   const session = ensureSession(tabId);
   session.port = port;
+  session.tabHeartbeatStale = false;
   session.page = {
     url: port.sender?.tab?.url || "",
     title: port.sender?.tab?.title || "",
@@ -157,10 +161,10 @@ chrome.runtime.onConnect.addListener((port) => {
   log("content script connected", `tab=${tabId}`, session.provider?.type || "unknown", `enabled=${session.enabled}`);
 
   readConfig().then((config) => {
-    port.postMessage({
+    safePortPostMessage(session, {
       type: "debug.set",
       enabled: !!config.debugLogs
-    });
+    }, "initial debug sync");
   }).catch((error) => {
     console.error("[web-model:bg] read config for debug sync failed", error);
   });
@@ -290,6 +294,7 @@ async function handlePortMessage(tabId, message) {
     if (!session.currentProviderKey || previousProviderType !== session.provider.type || shouldRegenerateProviderKey(session.provider, session.currentProviderKey, session.tabId)) {
       session.currentProviderKey = generateProviderKey(session.provider, session.tabId);
     }
+    session.tabHeartbeatStale = false;
     log("page ready", `tab=${tabId}`, session.page.url, session.provider.type, session.currentProviderKey);
     updateSessionState(session);
     if (session.enabled) {
@@ -328,6 +333,7 @@ async function handlePortMessage(tabId, message) {
 
   if (message.type === "pong") {
     session.lastTabPongAt = Date.now();
+    session.tabHeartbeatStale = false;
     return;
   }
 
@@ -545,13 +551,22 @@ function onSocketMessage(session, payload) {
         session.currentProviderKey || "pending-key"
       );
     }
-    session.port.postMessage({
+    if (!safePortPostMessage(session, {
       type: "chat.request",
       providerType: session.provider?.type || "",
       startNewChatBeforeSend: !!payload.start_new_chat_before_send,
       requestId: payload.request_id,
       request: payload.request
-    });
+    }, `chat request ${payload.request_id}`)) {
+      session.lastError = "provider page bridge disconnected";
+      session.state = "error";
+      session.detail = "provider page reconnecting";
+      sendToServer(session, {
+        type: "chat.error",
+        request_id: payload.request_id,
+        error: "provider page bridge disconnected"
+      });
+    }
     return;
   }
 
@@ -620,32 +635,69 @@ function clearSocketHeartbeat(session) {
   session.socketHeartbeatTimer = null;
 }
 
+function isDisconnectedPortError(error) {
+  return String(error && error.message ? error.message : error).includes("disconnected port object");
+}
+
+function handleDisconnectedTabPort(session, reason) {
+  if (!session) {
+    return;
+  }
+  log("provider page port stale", `tab=${session.tabId}`, reason);
+  clearTabHeartbeat(session);
+  try {
+    session.port?.disconnect();
+  } catch (_error) {
+  }
+  session.port = null;
+  session.tabHeartbeatStale = false;
+  if (session.enabled) {
+    session.state = "waiting_page";
+    session.detail = "provider page reconnecting";
+  }
+  updateSessionState(session);
+}
+
+function safePortPostMessage(session, payload, reason = "") {
+  if (!session?.port) {
+    return false;
+  }
+  try {
+    session.port.postMessage(payload);
+    return true;
+  } catch (error) {
+    if (isDisconnectedPortError(error)) {
+      handleDisconnectedTabPort(session, reason || "postMessage failed");
+      return false;
+    }
+    throw error;
+  }
+}
+
 function startTabHeartbeat(session) {
   clearTabHeartbeat(session);
   if (!session?.port) {
     return;
   }
   session.lastTabPongAt = Date.now();
+  session.tabHeartbeatStale = false;
   session.tabHeartbeatTimer = setInterval(() => {
     if (!session.port) {
       return;
     }
     if (session.lastTabPongAt && Date.now() - session.lastTabPongAt > TAB_HEARTBEAT_TIMEOUT_MS) {
-      log("tab heartbeat timeout", `tab=${session.tabId}`, session.currentProviderKey || "");
-      clearTabHeartbeat(session);
-      try {
-        session.port.disconnect();
-      } catch (_error) {
+      if (!session.tabHeartbeatStale) {
+        session.tabHeartbeatStale = true;
+        log("tab heartbeat delayed", `tab=${session.tabId}`, session.currentProviderKey || "");
+        ensureContentScriptInjectedForTab(session.tabId, session.page?.url || "").catch(() => {
+        });
       }
       return;
     }
-    try {
-      session.port.postMessage({
-        type: "ping",
-        at: Date.now()
-      });
-    } catch (_error) {
-    }
+    safePortPostMessage(session, {
+      type: "ping",
+      at: Date.now()
+    }, "tab heartbeat ping");
   }, TAB_HEARTBEAT_INTERVAL_MS);
 }
 
@@ -791,13 +843,10 @@ async function onConfigUpdated() {
 
   for (const session of tabSessions.values()) {
     if (session.port) {
-      try {
-        session.port.postMessage({
-          type: "debug.set",
-          enabled: !!config.debugLogs
-        });
-      } catch (_error) {
-      }
+      safePortPostMessage(session, {
+        type: "debug.set",
+        enabled: !!config.debugLogs
+      }, "config debug sync");
     }
     if (serverURLChanged) {
       clearRetryTimer(session);
@@ -834,6 +883,36 @@ async function hydrateSessionEnabledState(session) {
   if (session.enabled && session.provider) {
     session.currentProviderKey = ensureProviderKey(session);
     scheduleReconnect(session, "tab enabled");
+  }
+}
+
+async function reconcileSessions(reason) {
+  for (const session of tabSessions.values()) {
+    if (!session.enabled) {
+      continue;
+    }
+    if (!session.page?.url || !session.provider) {
+      continue;
+    }
+    if (!session.port) {
+      await ensureContentScriptInjectedForTab(session.tabId, session.page.url).catch(() => {
+      });
+      continue;
+    }
+    safePortPostMessage(session, {
+      type: "ping",
+      at: Date.now()
+    }, `reconcile ping: ${reason}`);
+    if (!session.port) {
+      await ensureContentScriptInjectedForTab(session.tabId, session.page.url).catch(() => {
+      });
+      continue;
+    }
+    if (session.tabHeartbeatStale) {
+      log("reconcile stale provider page", `tab=${session.tabId}`, reason);
+      await ensureContentScriptInjectedForTab(session.tabId, session.page.url).catch(() => {
+      });
+    }
   }
 }
 
